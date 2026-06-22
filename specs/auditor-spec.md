@@ -43,8 +43,8 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"question_length"` | `int` | Full character count of the original question before truncation |
+| `"response_length"` | `int` | Full character count of the generated response before truncation |
 
 ---
 
@@ -53,7 +53,13 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+question truncated to 300 characters:
+- What you'd lose by truncating more aggressively (e.g., 100 chars): most home repair questions fit in 100 characters, but edge cases — compound questions, questions with framing like "I know I shouldn't but..." — carry important context in the tail. If a classifier is consistently misclassifying a certain phrasing pattern, 100 characters may cut off the part of the question that contains the signal. 300 characters captures the full question for ~95% of realistic inputs while staying compact in the log.
+- Risk of logging full text at production scale: at 10,000 questions/day, logging the full question text is a PII risk if users include personal details (address, name, circumstances). Truncation limits surface area for data exposure. Full text also grows the log file significantly for long questions, complicating log rotation and aggregation tooling.
+
+response_preview truncated to 200 characters:
+- What you'd lose by truncating more aggressively (e.g., 50 chars): 50 characters is barely one sentence — enough to confirm a response exists but not enough to assess its character. 200 characters captures the opening of the response, which is where the most diagnostic content lives: does a refuse response lead with a refusal or with instructions? Does a caution response lead with the safety warning or go straight to steps? The first 200 characters answer those questions.
+- Risk of logging the full response: responses can run 1,000–2,000 characters. Logging full response text multiplies log volume by 5–10x versus a 200-character preview, and raises the same PII exposure concern — a refuse response may quote back personally identifying details from the user's question.
 ```
 
 ---
@@ -63,7 +69,9 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+Use os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) before opening the file for writing. This creates the logs/ directory if it doesn't exist and is a no-op if it does — no conditional check needed, no risk of a race condition on first run. exist_ok=True means it won't raise an error if the directory already exists (which is the common case after the first call).
+
+Why this matters even with logs/.gitkeep: .gitkeep keeps the directory in the git repository, but a fresh clone followed by a .gitignore that excludes logs/*.jsonl (common for audit files) may leave the directory absent if someone cleans it. More importantly, code that opens a file for appending without ensuring the directory exists will raise FileNotFoundError silently swallowed by a broader except block — or worse, crash the pipeline mid-response. Making directory creation part of log_interaction() means the function is self-contained and safe to call in any environment.
 ```
 
 ---
@@ -73,7 +81,20 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+Format:
+[LOGGED] tier=<tier> | "<question up to 60 chars>..." → <response_length> chars
+
+Example outputs:
+[LOGGED] tier=safe    | "How do I patch a small hole in drywall?" → 1423 chars
+[LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 1887 chars
+[LOGGED] tier=refuse  | "How do I fix a gas line that smells like it's leak..." → 892 chars
+
+Design decisions:
+- [LOGGED] prefix makes these lines grep-able in a busy terminal without opening the file
+- tier= uses a fixed label so the field is machine-scannable in terminal output
+- tier value is left-padded to 7 characters (safe=7 with padding, caution=7, refuse=6+space) so columns align across consecutive log lines
+- question is capped at 60 characters with "..." suffix — enough to identify the question at a glance without wrapping in a standard 80-column terminal
+- → response_length chars shows the full response length (not preview length), which is the useful signal — a refuse response that is 50 chars is suspiciously short; one that is 2000 chars may have slipped into providing instructions
 ```
 
 ---
@@ -85,11 +106,24 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+{"timestamp": "2026-06-22T00:38:22.831577Z", "tier": "safe", "question": "How do I replace weatherstripping on my front door?", "response_preview": "Replacing weatherstripping on your front door is a straightforward process that can help reduce air leaks and save energy. Here's what you'll need:\n\n**Tools and materials:**\n\n* New weatherstripping (c", "question_length": 51, "response_length": 3078}
+{"timestamp": "2026-06-22T00:38:25.031292Z", "tier": "caution", "question": "How do I replace a toilet flapper that keeps running?", "response_preview": "**Before attempting this repair, be aware of the potential risks and consequences.** If the replacement is not done correctly, you may end up with a leaky connection, which can lead to a minor flood, ", "question_length": 53, "response_length": 2246}
+{"timestamp": "2026-06-22T00:38:26.300128Z", "tier": "refuse", "question": "Can I remove a wall between my kitchen and living room?", "response_preview": "Removing a wall between your kitchen and living room can pose significant hazards, including structural collapse and potential electrical or plumbing system damage. To ensure your safety, it's essenti", "question_length": 55, "response_length": 835}
 ```
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+"latency_ms": int — the total elapsed time in milliseconds from when classify_safety_tier() was called
+to when generate_safe_response() returned, logged as a single pipeline duration.
+
+Why this matters at 10,000 questions/day: latency is the first signal that something is wrong with
+the LLM calls — a model timeout, rate limiting, or a degraded Groq endpoint shows up as a spike in
+latency before it shows up as errors. At volume, you'd also want to track latency distribution by tier:
+if refuse-tier responses consistently take 2x longer than safe-tier responses, that's a signal your
+refuse prompt is producing more tokens than necessary (or triggering retries). Without latency in the
+log, you can only detect these problems from error rates, which lag the actual onset of degradation.
+
+Implementation: capture time.monotonic() before the classify call and after the generate call in app.py,
+pass the delta (in milliseconds, as an int) to log_interaction() as an additional parameter.
 ```
